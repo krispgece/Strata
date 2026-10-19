@@ -867,6 +867,82 @@ first-token and decode timings. `GET /api/requests` returns summaries and `GET /
 monitor keeps the newest 100 requests in memory until restart, 262,144 characters per field, with visible truncation flags.
 Headers are not recorded. Treat the history as sensitive when Strata is reachable from a network, and set an API key.
 
+**Parked conversations on the disk (opt-in, `--conversation-disk-dir DIR`, with the conversation cache).** A
+conversation the RAM cache evicts (its slots or its byte budget full) is dropped, and a client that comes back to it
+reads the whole prompt again: an agent that switches between its main conversation and sub-agents too large for the
+budget together reads ~150K tokens again on every switch. With `--conversation-disk-dir DIR` the evicted conversation
+goes to `DIR` instead, and a request that continues it reads it back (the same validation and restore as a RAM-parked
+one) when the disk holds a longer prefix than the session, a `--batch` slot or the RAM cache:
+
+- every image of it (one per stage with `--layer-split`) is one session file, written and read with the session files'
+  code above (the same size, header and hash checks, and the free-space preflight `--session-min-free-mib`), with the
+  live state and every checkpoint, as in RAM; a park that does not fit the cache's byte budget goes to the disk too
+  (`sent to the disk` in the log) instead of being dropped;
+- a background thread (CPU nice 10 on Linux) writes the files, so a switch never waits for the disk; a conversation
+  asked for again before its write ends comes back from the write queue (a "RAM hit"). A queued image holds its RAM
+  until it is written: when RAM is short, parking and a read back wait for the queue before they evict more;
+- a read back needs RAM for the whole image above `--conversation-cache-min-free-mib`, as a park does; without it the
+  prompt is read again (`not restored (not enough RAM ...)`). A read back removes the conversation from the disk (the
+  session holds it again, and it is parked again on the next switch);
+- `--conversation-disk-mib N` (default 32768): the files' total, oldest out first. Without `--conversation-disk-persist`
+  the files' identity is a random number of the run: only this engine reads them, and its files (`strata-conv-*`) are
+  removed at start and when it ends;
+- the log has a line for every queue, write, hit and wait (MiB, ms, MB/s) and a totals line
+  (`strata serve: conversation disk: ...`); a request reused from the disk says so at the end of its line.
+
+`--conversation-disk-persist on|exit-only` (default `off`): the conversations outlive the engine, for whoever stops
+Strata between sessions or restarts it (an update, a settings change, a reboot). The files are bound to the session
+files' identity (the model files, the engine version and the settings that change the saved bytes); a small index file
+beside each conversation lets the next start take them in without reading the images, and files of another model,
+engine version or settings, a damaged index and leftovers of an interrupted write are removed at start. On QUIT the
+engine parks the current conversation, moves every parked one to the disk and waits for the writes; the server waits
+up to 300 s for that (20 s otherwise). While persist is on, the engine ignores SIGINT, SIGTERM and SIGHUP and ends only
+through its stdin (the server's QUIT, or EOF when the server is gone), so Ctrl+C in the server's terminal and the
+SIGTERM a shutdown sends to every process do not cut the save short. A crash or `kill -9` keeps what was already
+written. `exit-only` writes nothing while the engine runs (an eviction drops the conversation, as without a disk
+folder) and only saves at QUIT: on the box below, on one day of agent sessions the evictions' writes were never read
+back within a run (40 writes, 197 GiB, 34 requests that waited 4.5 min in all for a write), while both disk hits of the
+day came from the QUIT save.
+
+Measured on 2x CMP 50HX (sm_75, layer split), 2x Xeon E5-2670 v2, 64 GB RAM, NVMe ext4, Flash-Next IQ3_XXS, on
+0.2.0-beta with this change (`--conversation-disk-persist exit-only`, `--adapt-swaps 0`, greedy, 48 tokens): three
+conversations that share no prefix (41,839, 41,846 and 165,558 tokens, read cold in 22.5, 23.3 and 73.3 s), then a
+SIGTERM to the server: saved for the next start in 17.0 s (3 conversations, 5,786 MiB). The next start took in all
+three, and each came back from the disk with the same answer as before the restart: in 2.6, 2.9 and 8.4 s (the
+165,558-token one: 3,436 MiB read in 5.6 s at 643 MB/s, GPU restore 1.6 s). Earlier (2026-10-11, an older base) with a
+one-slot RAM cache that pushed conversations to the disk while the engine ran: a 165,557-token conversation came back in 6.4 s
+instead of a 77.8 s cold read; the background writes ran at 80-370 MB/s while the next prompt was read, and a request
+waited for a write once (0.9 s). Unit test: `conversation_disk_test` (CPU only, `-DSTRATA_BUILD_CONVERSATION_TESTS=ON`).
+Not run on Windows, HIP, SYCL or Metal.
+
+**Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
+decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
+re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
+seed** are honored per request (OpenAI and Anthropic fields), and so are stop strings (OpenAI `stop`, a string or up
+to 4; Anthropic `stop_sequences`): the answer ends before the first one, which is not sent, and the engine stops
+there (`finish_reason` "stop"; `stop_reason` "stop_sequence" with `stop_sequence` set to the one found); with the default adaptive expert tier a sampled result
+is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
+engine arguments. The run config's optional `sampling` block sets the defaults for requests that leave the fields out
+(`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`); a request's own fields always win. **With no
+block at all (0.1.45) a request without sampling keys gets the sampling the model card recommends**, picked by the
+request's thinking state: Qwen3.8-Flash-Next (and Gyro) thinking temperature 1.0, top_p 0.95, top_k 20; not thinking temperature 0.7,
+top_p 0.8, top_k 20, presence_penalty 1.5. Qwen3.6-35B-A3B thinking 1.0 / 0.95 / 20 with presence_penalty 1.5, not thinking
+0.7 / 0.8 / 20 with 1.5 (min_p 0 and repetition_penalty 1 are "off"). Order of precedence: the request, the web page's shared Chat settings,
+the config's `sampling` block, the card. Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config
+(before 0.1.45 a config without a block ran greedy, and greedy decoding is what makes small local models loop; #2685). The web page sends no sampling of its own until you change its Sampling settings (it showed and sent 0.6 before); an old stored 0.6 with the default top_p and top_k counts as not set. The penalties (`presence_penalty`, `frequency_penalty`,
+`repetition_penalty`, with `penalty_last_n` capping how many recent tokens they count over, default 64 when any
+penalty is set; llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request, #1819) ride the same path; they count the tokens the request has consumed, so a repetition penalty
+suppresses what the model itself just said, not the prompt alone. Since engine 0.1.19 they apply to every token
+the speculative decoding checks at once, exactly as if it decoded one token at a time (before, only the first of
+each batch got them). That makes requests with penalties 1-11% slower than in 0.1.18: the draft layer guesses
+without penalties, so more of its guesses are now rejected. Requests without penalties are unchanged. `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+
+**Batch MTP on a layer split (`--batch-mtp`).** Our measurement on 2x R9700 with all experts in VRAM: 80.2 -> 62.7 tok/s (-21.9%, 0/5 pairs faster) against the pipelined default, so it pays only when the experts do not all fit in VRAM (docs/BATCHING.md).
+
+**Token biases (opt-in).** The chat API supports request-scoped `logit_bias` objects and token/bias pair lists on supporting CUDA/HIP engines without continuous batching. A value of -100 (or `false` in a pair list) excludes a token. Unsupported engines return an error. See [LOGIT_BIAS.md](LOGIT_BIAS.md) for formats, limits and validation.
+
+**Sampled drafting (opt-in, 0.1.40.2).** With temperature above 0 the engine keeps a draft only when it equals the token the model sampled for that position, and the draft layer proposes its best guess. Two opt-in switches change how the draft layer drafts a sampled request; greedy requests (temperature 0) are never touched and stay byte-identical. `STRATA_SPEC_COUPLED=1` (or `--coupled-draft`) drafts by sampling with the request's own settings and the random number the checking row will use; the text for a seed does not change. `STRATA_SPEC_PROB=1` is speculative rejection sampling: the draft layer samples its guess from its own distribution q, the check accepts it with probability min(1, p/q) (p is the model's distribution after penalties, top_k, top_p, min_p and temperature) and otherwise samples the replacement from the leftover distribution, so every token is distributed exactly as without drafts (the text for a seed then depends on the drafts, so it is reproducible only for the same engine, flags and prompt). Guesses without a distribution (prompt lookup, suffix drafts) keep the exact-match rule, which is already exact. Neither is faster in a way that holds up: on an RTX 3060 (IQ3_XXS, 200-token story and code answers, 10 interleaved pairs) the default's median output speed was 42.4 / 43.2 / 43.3 tok/s at temperature 0.3 / 0.7 / 1.0, coupled drafting 40.6 / 42.4 / 43.3 and rejection sampling 41.0 / 42.6 / 42.6, with run-to-run differences of up to 5% between repeats; drafts kept per round fell at 0.3 and rose by about 5 points at 1.0, which the cost of the longer sampled windows ate. `STRATA_SPEC_DEPTH=1` prints the acceptance by draft depth for each request; `STRATA_SPEC_MIN_TEMP=0.9` limits sampled drafting to hotter requests. Proof that the rejection rule keeps the distribution: `spec_prob_test` (chi-square, 2 million trials per case) and `spec_verify_parity` (GPU against the host reference).
+
 ---
 
 ### The Responses API and Codex CLI
