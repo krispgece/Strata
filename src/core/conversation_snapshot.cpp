@@ -2,6 +2,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
+#include "strata/core/on_device.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -255,6 +256,13 @@ bool park_trace_on() {
     return on;
 }
 
+// the card a K/V source or target is made on (its session's: the caller's OnDevice); -1 when there is none to read
+int current_device() {
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return -1; }
+    return dev;
+}
+
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
@@ -421,6 +429,34 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
 }
 } // namespace
 
+bool conversation_kv_target(SessionKvTarget& out, const QsaState& st, const ModelGeometry& g,
+                            int64_t upto, bool index, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    SessionKvTarget t;
+    t.format = l.format; t.cells = l.cells; t.heads = g.n_head_kv; t.head_dim = g.head_dim;
+    t.page_size = l.page_size; t.pooled_rows = l.pooled_rows; t.idx_dim = g.idx_key_dim;
+    t.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto dst = pools(st);
+    for (size_t i = 0; i < dst.size(); ++i)
+        if (t.sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    const auto sizes = t.sizes;
+    auto why = std::make_shared<std::string>();
+    const int dev = current_device();   // the pools' card: the file is read later, with another one current maybe
+    t.write = [dst, sizes, why, dev](size_t part, size_t offset, const void* src, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V write out of range"; return false; }
+        const OnDevice on(dev);
+        return transfer(static_cast<uint8_t*>(dst[part]) + offset, src, n, *why);
+    };
+    t.error = [why] { return *why; };
+    out = std::move(t);
+    return true;
+}
+
+bool conversation_kv_finish(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    return refresh_residency(st, g, upto, error);
+}
+
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error, bool queued) {
     Layout lf{}, lt{};
@@ -525,8 +561,10 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     const auto src = pools(st);
     const auto sizes = s.sizes;
     auto why = std::make_shared<std::string>();
-    s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+    const int dev = current_device();   // the pools' card: a later read (a disk write) may run with another one current
+    s.read = [src, sizes, why, dev](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
+        const OnDevice on(dev);
         return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
     };
     s.error = [why] { return *why; };

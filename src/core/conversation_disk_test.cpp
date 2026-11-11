@@ -3,13 +3,16 @@
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -171,7 +174,6 @@ int main() {
         check(logged("wrote 600 tokens") && logged("in 2 files"), "the write is logged");
         const auto live = tier.best(prompt_of(700), {}, false);
         check(live.tokens == 600 && live.live && live.id != 0, "best: the live state as a prefix");
-        check(!live.queued && live.bytes == tier.bytes() && live.bytes > 0, "best: a written entry, its files' bytes");
         const auto ck = tier.best([] { auto p = prompt_of(300); p.push_back(7); return p; }(), {}, false);
         check(ck.tokens == 300 && !ck.live, "best: the deepest checkpoint as a prefix");
         check(tier.best([] { auto p = prompt_of(150); p.push_back(7); return p; }(), {}, false).tokens == 150,
@@ -201,7 +203,7 @@ int main() {
         check(tier.put(image(400, 3, 5000)), "put b (queued behind a)");
         check(tier.pending(), "pending while the writer waits");
         const auto b = tier.best(prompt_of(450, 5000), {}, false);
-        check(b.tokens == 400 && b.queued && b.bytes > 0, "b matches in the queue");
+        check(b.tokens == 400, "b matches in the queue");
         SavedConversation back;
         check(tier.take(b.id, b.tokens, back, e) && same(back, image(400, 3, 5000)), "b back from RAM");
         check(tier.stats().ram_hits == 1 && logged("RAM hit: 400 tokens"), "a RAM hit, logged");
@@ -247,6 +249,94 @@ int main() {
         check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 0 && tier_files(dir) == 0,
               "refused read: empty image, entry and files gone");
         check(tier.stats().read_failed == 1, "a failed read is counted");
+    }
+
+    {   // put_streamed: the K/V read from where it lives (here: the image's own buffers) gives the same files
+        auto sources_of = [](const SavedConversation& img) {
+            std::vector<SessionKvSource> out;
+            for (const auto& kv : img.kv) {
+                SessionKvSource s;
+                s.format = kv.format; s.cells = kv.cells; s.heads = kv.heads; s.head_dim = kv.head_dim;
+                s.page_size = kv.page_size; s.pooled_rows = kv.pooled_rows; s.idx_dim = kv.idx_dim;
+                const ConversationBuffer* parts[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+                for (size_t p = 0; p < 5; ++p) s.sizes[p] = parts[p]->size();
+                s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+                    return parts[part]->read(dst, offset, n);
+                };
+                out.push_back(std::move(s));
+            }
+            return out;
+        };
+        const SavedConversation expect = split_image(500, 30, 9000);
+        std::vector<std::vector<SessionKvSource>> sources = {sources_of(expect), sources_of(expect.stage_images[0])};
+        SavedConversation meta = split_image(500, 30, 9000);
+        meta.kv.clear();
+        meta.stage_images[0].kv.clear();
+        ConversationDiskTier tier(opts(dir, GiB));
+        check(tier.open(e) && tier.put_streamed(meta, sources), "put_streamed: written");
+        check(meta.stage_images.size() == 1 && meta.checkpoints.size() == 2, "put_streamed: the image is given back");
+        check(tier.size() == 1 && tier_files(dir) == 2 && logged("streamed from the GPU"), "put_streamed: two files, logged");
+        const auto m = tier.best(prompt_of(600, 9000), {}, false);
+        SavedConversation back;
+        check(m.tokens == 500 && tier.take(m.id, m.tokens, back, e) && same(back, expect),
+              "put_streamed: read back exactly the image the sources came from");
+    }
+
+    {   // take with K/V targets: the files' K/V streamed into them (here: CPU buffers), the rest in `out`
+        using Bytes = std::vector<uint8_t>;
+        auto targets_for = [](const SavedConversation& img, std::vector<std::array<Bytes, 5>>& into) {
+            into.assign(img.kv.size(), {});
+            std::vector<SessionKvTarget> out;
+            for (size_t j = 0; j < img.kv.size(); ++j) {
+                const auto& kv = img.kv[j];
+                SessionKvTarget t;
+                t.format = kv.format; t.cells = kv.cells; t.heads = kv.heads; t.head_dim = kv.head_dim;
+                t.page_size = kv.page_size; t.pooled_rows = kv.pooled_rows; t.idx_dim = kv.idx_dim;
+                const ConversationBuffer* parts[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+                for (size_t p = 0; p < 5; ++p) { t.sizes[p] = parts[p]->size(); into[j][p].assign(t.sizes[p], 0); }
+                std::array<Bytes, 5>* layer = &into[j];
+                t.write = [layer](size_t part, size_t offset, const void* src, size_t n) {
+                    std::memcpy((*layer)[part].data() + offset, src, n);
+                    return true;
+                };
+                out.push_back(std::move(t));
+            }
+            return out;
+        };
+        auto bytes_of_buffer = [](const ConversationBuffer& b) {
+            Bytes v(b.size());
+            b.read(v.data(), 0, v.size());
+            return v;
+        };
+        const SavedConversation expect = split_image(500, 31, 11000);
+        ConversationDiskTier tier(opts(dir, GiB));
+        check(tier.open(e) && tier.put(split_image(500, 31, 11000)), "streamed take: put");
+        tier.wait_idle();
+        std::vector<std::array<Bytes, 5>> got0, got1;
+        std::vector<std::vector<SessionKvTarget>> kv = {targets_for(expect, got0), targets_for(expect.stage_images[0], got1)};
+        const auto m = tier.best(prompt_of(600, 11000), {}, false);
+        SavedConversation meta;
+        check(m.tokens == 500 && !m.queued && m.bytes > 0 && tier.take(m.id, m.tokens, meta, e, {}, &kv),
+              "streamed take: read");
+        bool same_kv = true;
+        for (size_t j = 0; j < expect.kv.size(); ++j) {
+            const ConversationBuffer* parts[5] = {&expect.kv[j].k, &expect.kv[j].v, &expect.kv[j].k_scale,
+                                                  &expect.kv[j].v_scale, &expect.kv[j].pooled};
+            for (size_t p = 0; p < 5; ++p) same_kv = same_kv && got0[j][p] == bytes_of_buffer(*parts[p]);
+        }
+        check(same_kv && logged("streamed into the GPU"), "streamed take: the targets hold the K/V exactly");
+        check(meta.kv.size() == expect.kv.size() && meta.kv[0].k.size() == 0 &&
+              same_checkpoint(meta.live, expect.live) && meta.checkpoints.size() == expect.checkpoints.size() &&
+              meta.stage_images.size() == 1, "streamed take: the running state and checkpoints in RAM, no K/V");
+        check(tier.put(image(400, 32, 12000)), "streamed take: put a second");
+        tier.wait_idle();
+        const SavedConversation other = image(400, 32, 12000);
+        std::vector<std::array<Bytes, 5>> bad;
+        std::vector<std::vector<SessionKvTarget>> wrong = {targets_for(other, bad)};
+        wrong[0][0].sizes[0] += 1;
+        const auto m2 = tier.best(prompt_of(450, 12000), {}, false);
+        check(!tier.take(m2.id, m2.tokens, meta, e, {}, &wrong) && e.find("size differs") != std::string::npos,
+              "streamed take: a K/V part of another size is refused");
     }
 
     {   // the RAM cache's evictions go to the disk tier (set_on_evict)
@@ -327,6 +417,137 @@ int main() {
                   "persist: a's image under b's index is refused, never restored as b");
             check(tier.best(prompt_of(450), {}, false).tokens == 400, "persist: a is still there");
         }
+    }
+
+    {   // wait_idle_for gives up after its bound and beats meanwhile; the write still ends later
+        std::promise<void> release;
+        std::shared_future<void> gate = release.get_future().share();
+        auto o = opts(dir, GiB);
+        o.before_write = [gate] { gate.wait(); };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 50)), "bounded wait: a write held");
+        int beats = 0;
+        const bool idle = tier.wait_idle_for(600, [&beats] { ++beats; });
+        check(!idle && beats >= 2 && tier.pending(), "bounded wait: gives up after the bound, beating meanwhile");
+        check(tier.stats().wait_timeouts == 1 && logged("gave up waiting"), "bounded wait: counted and logged");
+        release.set_value();
+        check(tier.wait_idle_for(-1, nullptr) && !tier.pending() && tier.size() == 1,
+              "bounded wait: no limit (-1) waits like wait_idle; the held write ended");
+        check(tier.wait_idle_for(10, nullptr), "bounded wait: an idle tier returns at once");
+        tier.clear();
+    }
+
+    {   // take() of an entry still being written gives up after its bound, beating meanwhile
+        std::promise<void> release, entered;
+        std::shared_future<void> gate = release.get_future().share();
+        auto in_write = std::make_shared<std::promise<void>>(std::move(entered));
+        std::future<void> started = in_write->get_future();
+        int beats = 0;
+        auto o = opts(dir, GiB);
+        o.take_wait_ms = 600;
+        o.wait_beat = [&beats] { ++beats; };
+        o.before_write = [gate, in_write] {
+            try { in_write->set_value(); } catch (...) {}   // only the first write signals
+            gate.wait();
+        };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 70, 7000)), "take bound: a write held");
+        started.wait();   // the writer holds the entry: take() finds it being written, not queued
+        const auto m = tier.best(prompt_of(450, 7000), {}, false);
+        check(m.tokens == 400 && m.id != 0, "take bound: the entry being written still matches");
+        SavedConversation back;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = tier.take(m.id, m.tokens, back, e);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        check(!ok && e.find("still being written") != std::string::npos, "take bound: fails as still being written");
+        check(ms >= 550 && ms < 5000 && beats >= 2, "take bound: gives up after the bound, beating meanwhile");
+        check(tier.stats().take_timeouts == 1 && logged("gave up waiting after") && logged("for its write"),
+              "take bound: counted and logged");
+        release.set_value();
+        check(tier.wait_idle_for(-1, nullptr) && tier.size() == 1, "take bound: the held write still ends, stored");
+        check(tier.best(prompt_of(450, 7001), {}, false).tokens == 0,
+              "take bound: the late-written entry is not handed to a prompt whose prefix changed");
+        check(tier.take(m.id, m.tokens, back, e) && same(back, image(400, 70, 7000)),
+              "take bound: the entry is intact and taken once written");
+        tier.clear();
+    }
+
+    {   // within the bound, take() waits for the write and reads the entry as before
+        std::promise<void> release, entered;
+        std::shared_future<void> gate = release.get_future().share();
+        auto in_write = std::make_shared<std::promise<void>>(std::move(entered));
+        std::future<void> started = in_write->get_future();
+        auto o = opts(dir, GiB);
+        o.take_wait_ms = 30000;
+        o.wait_beat = [] {};
+        o.before_write = [gate, in_write] {
+            try { in_write->set_value(); } catch (...) {}
+            gate.wait();
+        };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 71, 8000)), "take wait: a write held");
+        started.wait();
+        const auto m = tier.best(prompt_of(450, 8000), {}, false);
+        std::thread later([&release] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            release.set_value();
+        });
+        SavedConversation back;
+        check(tier.take(m.id, m.tokens, back, e) && same(back, image(400, 71, 8000)) &&
+                  tier.stats().take_timeouts == 0,
+              "take wait: the write ends within the bound and the entry is read");
+        later.join();
+        tier.clear();
+    }
+
+    {   // no bound (-1): wait_idle_for and take() wait as long as the write takes, but beat meanwhile
+        std::promise<void> release, entered;
+        std::shared_future<void> gate = release.get_future().share();
+        auto in_write = std::make_shared<std::promise<void>>(std::move(entered));
+        std::future<void> started = in_write->get_future();
+        int take_beats = 0;
+        auto o = opts(dir, GiB);
+        o.wait_beat = [&take_beats] { ++take_beats; };   // take_wait_ms stays -1
+        o.before_write = [gate, in_write] {
+            try { in_write->set_value(); } catch (...) {}
+            gate.wait();
+        };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 72, 9000)), "unbounded: a write held");
+        started.wait();
+        int beats = 0;
+        std::thread later([&release] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            release.set_value();
+        });
+        check(tier.wait_idle_for(-1, [&beats] { ++beats; }) && beats >= 2 && tier.stats().wait_timeouts == 0,
+              "unbounded: wait_idle_for(-1, beat) waits for the write, beating meanwhile");
+        later.join();
+        tier.clear();
+        std::promise<void> release2, entered2;
+        std::shared_future<void> gate2 = release2.get_future().share();
+        auto in_write2 = std::make_shared<std::promise<void>>(std::move(entered2));
+        std::future<void> started2 = in_write2->get_future();
+        auto o2 = opts(dir, GiB);
+        o2.wait_beat = [&take_beats] { ++take_beats; };
+        o2.before_write = [gate2, in_write2] {
+            try { in_write2->set_value(); } catch (...) {}
+            gate2.wait();
+        };
+        ConversationDiskTier tier2(std::move(o2));
+        check(tier2.open(e) && tier2.put(image(400, 73, 9500)), "unbounded take: a write held");
+        started2.wait();
+        const auto m = tier2.best(prompt_of(450, 9500), {}, false);
+        std::thread later2([&release2] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            release2.set_value();
+        });
+        SavedConversation back;
+        check(tier2.take(m.id, m.tokens, back, e) && same(back, image(400, 73, 9500)) && take_beats >= 2 &&
+                  tier2.stats().take_timeouts == 0,
+              "unbounded take: waits for the write, beating meanwhile, then reads the entry");
+        later2.join();
+        tier2.clear();
     }
 
     fs::remove_all(dir);

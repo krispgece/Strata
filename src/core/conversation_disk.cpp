@@ -1,8 +1,6 @@
 // src/core/conversation_disk.cpp - the disk tier of the parked conversations.  See the header.
 #include "strata/core/conversation_disk.hpp"
 
-#include "strata/core/conversation_file.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
@@ -318,16 +316,13 @@ bool ConversationDiskTier::put(SavedConversation&& image) {
         ++stats_.write_failed;
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        job.entry.id = ++next_id_;
-        ++stats_.queued;
-    }
     size_t depth = 0;
     uint64_t queued_bytes = 0;
     const uint64_t estimate = job.entry.bytes;
     {
         std::lock_guard<std::mutex> lock(m_);
+        job.entry.id = ++next_id_;
+        ++stats_.queued;
         queue_.push_back(std::move(job));
         depth = queue_.size();
         for (const auto& j : queue_) queued_bytes += j.entry.bytes;
@@ -366,46 +361,86 @@ void ConversationDiskTier::writer() {
 
 void ConversationDiskTier::write(Job& job) {
     if (options_.before_write) options_.before_write();
-    const size_t tokens = job.entry.live.ids.size();
+    std::vector<SavedConversation> parts = std::move(job.image.stage_images);   // one file per image, none nested
+    job.image.stage_images.clear();
+    const SessionFileIdentity id = file_identity();
+    store(std::move(job.entry), parts.size() + 1,
+          [&](size_t k, const std::string& path, size_t& written, std::string& error) {
+              return session_file_write(path, k == 0 ? job.image : parts[k - 1], id, written, error, write_options());
+          }, "");
+    job.image = SavedConversation{};   // the RAM goes back now, written or not
+}
+
+bool ConversationDiskTier::put_streamed(SavedConversation& meta,
+                                        const std::vector<std::vector<SessionKvSource>>& sources) {
+    if (!open_ || sources.size() != meta.stage_images.size() + 1) return false;
+    Entry e;
+    e.live = key_of(meta.live);
+    for (const auto& c : meta.checkpoints) e.checkpoints.push_back(key_of(c));
+    e.cvec = meta.cvec;
+    e.bytes = meta.bytes();
+    for (const auto& image : sources)
+        for (const auto& layer : image)
+            for (size_t part : layer.sizes) e.bytes += part;
+    if (e.bytes > options_.budget_bytes) {
+        log(fmt("dropped %zu tokens: %.0f MiB is over the disk budget", e.live.ids.size(), mib(e.bytes)));
+        std::lock_guard<std::mutex> lock(m_);
+        ++stats_.write_failed;
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        e.id = ++next_id_;
+    }
+    std::vector<SavedConversation> parts = std::move(meta.stage_images);
+    meta.stage_images.clear();
+    const SessionFileIdentity id = file_identity();
+    const bool ok = store(std::move(e), parts.size() + 1,
+                          [&](size_t k, const std::string& path, size_t& written, std::string& error) {
+                              return session_file_write(path, k == 0 ? meta : parts[k - 1], sources[k], id, written,
+                                                        error, write_options());
+                          }, ", streamed from the GPU");
+    meta.stage_images = std::move(parts);   // given back as it came: the caller lent its checkpoints
+    return ok;
+}
+
+SessionWriteOptions ConversationDiskTier::write_options() const {
+    SessionWriteOptions wo;
+    wo.min_free_bytes = options_.min_free_bytes;
+    wo.durable = false;   // a cache: a file a power loss damages fails its hash check and is read again from the prompt
+    return wo;
+}
+
+bool ConversationDiskTier::store(Entry e, size_t images, const WriteFile& write_file, const char* how) {
+    const size_t tokens = e.live.ids.size();
     size_t made_room = 0;
     {
         std::lock_guard<std::mutex> lock(m_);
-        while (!entries_.empty() && bytes_ + job.entry.bytes > options_.budget_bytes) {
+        while (!entries_.empty() && bytes_ + e.bytes > options_.budget_bytes) {
             remove_locked(0, true);
             ++made_room;
         }
         stats_.evicted += made_room;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    // one session file per image: the first stage's, then each later stage's (the writer takes no nested images)
-    std::vector<SavedConversation> parts = std::move(job.image.stage_images);
-    job.image.stage_images.clear();
-    const SessionFileIdentity id = file_identity();
-    SessionWriteOptions wo;
-    wo.min_free_bytes = options_.min_free_bytes;
-    wo.durable = false;   // a cache: a file a power loss damages fails its hash check and is read again from the prompt
-    Entry e = std::move(job.entry);
     e.bytes = 0;
     std::string error;
-    auto write_one = [&](const SavedConversation& img, size_t k) -> bool {
+    bool ok = true;
+    for (size_t k = 0; ok && k < images; ++k) {
         char name[96];
         std::snprintf(name, sizeof name, "%s%016llx-%llu-%zu.bin", file_prefix(), (unsigned long long) nonce_,
                       (unsigned long long) e.id, k);
         const std::string path = (fs::path(options_.dir) / name).string();
         size_t written = 0;
-        if (!session_file_write(path, img, id, written, error, wo)) {
+        ok = write_file(k, path, written, error);
+        if (!ok) {
             remove_file(path);
-            return false;
+            break;
         }
         e.files.push_back(path);
         e.bytes += written;
-        return true;
-    };
-    bool ok = write_one(job.image, 0);
-    for (size_t k = 0; ok && k < parts.size(); ++k) ok = write_one(parts[k], k + 1);
+    }
     if (ok && options_.persist) ok = write_index(e, error);   // after the images: an index names complete files only
-    job.image = SavedConversation{};   // the RAM goes back now, written or not
-    parts.clear();
     const double ms = ms_since(t0);
     if (!ok) {
         for (const auto& f : e.files) remove_file(f);
@@ -414,7 +449,7 @@ void ConversationDiskTier::write(Job& job) {
             ++stats_.write_failed;
         }
         log(fmt("dropped %zu tokens: the write failed after %.0f ms (%s)", tokens, ms, error.c_str()));
-        return;
+        return false;
     }
     const uint64_t b = e.bytes;
     const size_t nfiles = e.files.size();
@@ -430,13 +465,15 @@ void ConversationDiskTier::write(Job& job) {
         on_disk = entries_.size();
         disk_bytes = bytes_;
     }
-    log(fmt("wrote %zu tokens: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; %zu removed for "
-            "the budget", tokens, mib(b), nfiles, nfiles == 1 ? "" : "s", ms, mbps(b, ms), on_disk,
+    log(fmt("wrote %zu tokens%s: %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s); on disk %zu, %.0f MiB; %zu removed for "
+            "the budget", tokens, how, mib(b), nfiles, nfiles == 1 ? "" : "s", ms, mbps(b, ms), on_disk,
             mib(disk_bytes), made_room));
+    return true;
 }
 
 bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
-                                const std::function<bool(uint64_t, std::string&)>& admit) {
+                                const std::function<bool(uint64_t, std::string&)>& admit,
+                                const std::vector<std::vector<SessionKvTarget>>* kv) {
     out = SavedConversation{};
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_);
@@ -444,6 +481,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     // still queued: back from RAM, no disk at all
     for (size_t i = 0; i < queue_.size(); ++i)
         if (queue_[i].entry.id == id) {
+            if (kv) { error = "still queued: its image is in RAM"; return false; }
             out = std::move(queue_[i].image);
             const uint64_t b = queue_[i].entry.bytes;
             queue_.erase(queue_.begin() + (std::ptrdiff_t) i);
@@ -459,7 +497,35 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     double waited = 0;
     if (writing_ && writing_entry_.id == id) {
         const auto w0 = std::chrono::steady_clock::now();
-        cv_.wait(lock, [&] { return !(writing_ && writing_entry_.id == id); });
+        const auto written = [&] { return !(writing_ && writing_entry_.id == id); };
+        const int64_t bound = options_.take_wait_ms;
+        if (bound < 0 && !options_.wait_beat) {
+            cv_.wait(lock, written);
+        } else {
+            // A slow disk held the request here for as long as this entry's write took, with no beat (a watchdog
+            // restart past 60 s).  It beats while it waits; with a bound, past it the caller reads the prompt instead.
+            const auto deadline = w0 + std::chrono::milliseconds(std::max<int64_t>(bound, 0));
+            bool done = written();
+            while (!done) {
+                const auto now = std::chrono::steady_clock::now();
+                if (bound >= 0 && now >= deadline) break;
+                const auto slice = bound < 0 ? std::chrono::steady_clock::duration(std::chrono::milliseconds(250))
+                    : std::min<std::chrono::steady_clock::duration>(deadline - now, std::chrono::milliseconds(250));
+                if (cv_.wait_for(lock, slice, written)) { done = true; break; }
+                if (options_.wait_beat) { lock.unlock(); options_.wait_beat(); lock.lock(); }
+                done = written();
+            }
+            if (!done) {
+                ++stats_.take_timeouts;
+                const double ms = ms_since(w0);
+                lock.unlock();
+                if (options_.wait_beat) options_.wait_beat();
+                error = fmt("still being written: gave up after %.0f ms (bound %lld ms)", ms, (long long) bound);
+                log(fmt("%lld tokens: gave up waiting after %.0f ms for its write (bound %lld ms): the prompt is read",
+                        (long long) tokens, ms, (long long) bound));
+                return false;   // the entry stays with its write and is still there for a later request
+            }
+        }
         waited = ms_since(w0);
     }
     size_t index = entries_.size();
@@ -472,6 +538,10 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     }
     const Entry want = entries_[index];
     const std::vector<std::string>& files = want.files;
+    if (kv && kv->size() != files.size()) {
+        error = "one set of K/V targets per file is needed";
+        return false;
+    }
     remove_locked(index, false);   // the entry goes now; its files are deleted after the read, whatever it gives
     lock.unlock();
     const SessionFileIdentity fid = file_identity();
@@ -482,7 +552,8 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     for (size_t k = 0; ok && k < files.size(); ++k) {
         SavedConversation part;
         size_t n = 0;
-        ok = session_file_read(files[k], fid, part, n, error, limits);
+        ok = kv ? session_file_read(files[k], fid, part, (*kv)[k], n, error, limits)
+                : session_file_read(files[k], fid, part, n, error, limits);
         bytes += n;
         if (!ok) break;
         if (k == 0) out = std::move(part);
@@ -507,8 +578,9 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     stats_.read_ms += ms - waited;
     stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
     lock.unlock();
-    log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s", (long long) tokens, mib(bytes),
+    log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s%s", (long long) tokens, mib(bytes),
             files.size(), files.size() == 1 ? "" : "s", ms - waited, mbps(bytes, ms - waited),
+            kv ? ", streamed into the GPU" : "",
             waited > 0 ? fmt(", after %.0f ms waiting for its write", waited).c_str() : ""));
     log(summary());
     return true;
@@ -531,6 +603,34 @@ double ConversationDiskTier::wait_idle() {
     lock.unlock();
     log(fmt("waited %.0f ms for %zu queued write%s (their RAM was needed)", ms, depth, depth == 1 ? "" : "s"));
     return ms;
+}
+
+bool ConversationDiskTier::wait_idle_for(int64_t max_ms, const std::function<void()>& beat) {
+    if (max_ms < 0 && !beat) { wait_idle(); return true; }
+    std::unique_lock<std::mutex> lock(m_);
+    if (queue_.empty() && !writing_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto deadline = t0 + std::chrono::milliseconds(std::max<int64_t>(max_ms, 0));
+    const size_t depth = queue_.size() + (writing_ ? 1 : 0);
+    bool idle = false;
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (max_ms >= 0 && now >= deadline) break;
+        const auto slice = max_ms < 0 ? std::chrono::steady_clock::duration(std::chrono::milliseconds(250))
+            : std::min<std::chrono::steady_clock::duration>(deadline - now, std::chrono::milliseconds(250));
+        if (cv_.wait_for(lock, slice, [&] { return queue_.empty() && !writing_; })) { idle = true; break; }
+        if (beat) { lock.unlock(); beat(); lock.lock(); }
+    }
+    const double ms = ms_since(t0);
+    ++stats_.waits;
+    stats_.wait_ms += ms;
+    if (!idle) ++stats_.wait_timeouts;
+    lock.unlock();
+    if (beat) beat();
+    log(idle ? fmt("waited %.0f ms for %zu queued write%s (their RAM was needed)", ms, depth, depth == 1 ? "" : "s")
+             : fmt("gave up waiting after %.0f ms for %zu queued write%s (bound %lld ms): the park is skipped", ms, depth,
+                   depth == 1 ? "" : "s", (long long) max_ms));
+    return idle;
 }
 
 size_t ConversationDiskTier::size() const {

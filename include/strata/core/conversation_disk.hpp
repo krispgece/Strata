@@ -30,6 +30,11 @@ struct ConversationDiskOptions {
     SessionFileIdentity identity;    ///< persist: the session files' identity (model and settings fingerprints)
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
     std::function<void(const std::string&)> log;
+    /// take() waits at most this long for its entry's write to end (negative: no limit, the default), calling
+    /// `wait_beat` (if set) about every 250 ms meanwhile so a watchdog sees a wait that moves.  Past a bound the take
+    /// fails ("still being written"), the entry is left to its write, and the caller reads the prompt instead.
+    int64_t take_wait_ms = -1;
+    std::function<void()> wait_beat;
     /// Tests: called on the writer thread before each write starts.
     std::function<void()> before_write;
 };
@@ -38,6 +43,7 @@ struct ConversationDiskOptions {
 struct ConversationDiskStats {
     size_t queued = 0, written = 0, write_failed = 0, ram_hits = 0, disk_hits = 0, read_failed = 0;
     size_t evicted = 0, waits = 0;
+    size_t wait_timeouts = 0, take_timeouts = 0;   ///< bounded waits (wait_idle_for, take) that gave up
     uint64_t bytes_written = 0, bytes_read = 0;
     uint64_t tokens_back = 0;                 ///< prompt tokens given back (not read again) by ram or disk hits
     double write_ms = 0, read_ms = 0, wait_ms = 0;
@@ -61,13 +67,20 @@ public:
     /// with it (they hold no K/V), so a prompt that leaves the conversation early still resumes from one.  False when
     /// the tier is off or over budget.
     bool put(SavedConversation&& image);
+    /// Writes a conversation straight from where it lives, on the caller's thread: `meta` holds all but the K/V
+    /// (stage images likewise), `sources[k]` the K/V of image k (the first stage's, then each later stage's).  For a
+    /// park the RAM check refuses: the conversation goes to the disk instead of being dropped.  The caller keeps the
+    /// session as it is until this returns; `meta` is given back as it came.  False when the tier is off, the write
+    /// fails or it is over budget.
+    bool put_streamed(SavedConversation& meta, const std::vector<std::vector<SessionKvSource>>& sources);
 
     struct Match {
         uint64_t id = 0;        ///< the entry (stable while the writer runs; 0 = none)
         int64_t tokens = 0;
         bool live = false;
-        uint64_t bytes = 0;     ///< the entry's files (queued: the image's estimate)
-        bool queued = false;    ///< still in RAM: take() hands it back without reading a file
+        uint64_t bytes = 0;     ///< its files' bytes (queued: the image's)
+        bool queued = false;    ///< still in the write queue: its image is in RAM
+        int64_t written = 0;    ///< the length the files hold (the live state's): deeper than `tokens` on a checkpoint
     };
     /// The longest prefix of `prompt` an entry holds (its live state or its checkpoint), queued or on the disk, as
     /// ConversationCache::best; ties prefer the newest entry.
@@ -79,7 +92,8 @@ public:
             if (e.cvec != cvec) return;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
-                if (n > best.tokens || (n == best.tokens && n > 0 && e.id > best.id)) best = {e.id, n, live, e.bytes, queued};
+                if (n > best.tokens || (n == best.tokens && n > 0 && e.id > best.id))
+                    best = {e.id, n, live, e.bytes, queued, (int64_t) e.live.ids.size()};
             };
             consider(e.live, true);
             for (const auto& c : e.checkpoints) consider(c, false);
@@ -94,13 +108,20 @@ public:
     /// when it is still queued, else from the disk (waiting for its write when it is being written).  `admit(need,
     /// why)` is asked before each file's payload is allocated (session_file_read's RAM preflight).  `tokens` is what
     /// the request reuses (diagnostics).  On failure `out` is empty and `error` says why.
+    /// With `kv` (per image, its K/V targets: conversation_snapshot_targets) the files' K/V is streamed into them
+    /// instead of RAM, and `out` gets the rest; a queued entry is refused (its image is in RAM: take it without).
+    /// On failure after a read began, the targets may hold part of it.
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
-              const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {});
+              const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {},
+              const std::vector<std::vector<SessionKvTarget>>* kv = nullptr);
 
     /// Whether images wait in the queue or are being written (their RAM is not back yet).
     bool pending() const;
     /// Blocks until the queue is empty and no write runs; returns the ms it waited.
     double wait_idle();
+    /// Like wait_idle(), but calls `beat` (if set) about every 250 ms while it waits so a watchdog sees a wait that
+    /// moves, and gives up after `max_ms` (negative: no limit).  True when the tier went idle.
+    bool wait_idle_for(int64_t max_ms, const std::function<void()>& beat);
     /// #879: every conversation goes - queued, being written (waited for) and on the disk, files too.  Returns how many.
     size_t clear();
 
@@ -128,7 +149,10 @@ private:
         SavedConversation image;
     };
     void writer();
+    using WriteFile = std::function<bool(size_t image, const std::string& path, size_t& written, std::string& error)>;
     void write(Job& job);                                    // without the lock
+    bool store(Entry e, size_t images, const WriteFile& write_file, const char* how);   // writes e's files, keeps e
+    SessionWriteOptions write_options() const;
     void remove_locked(size_t index, bool delete_files);     // m_ held
     void log(const std::string& line) const;
     SessionFileIdentity file_identity() const;
