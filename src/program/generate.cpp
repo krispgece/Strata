@@ -12163,6 +12163,17 @@ int main(int argc, char** argv) {
             return true;
         };
         // --conversation-disk-dir: the RAM cache's evictions go to the disk (conversation_disk.hpp)
+        // (local build) STRATA_CONV_DISK_DIR / STRATA_CONV_DISK_MIB stand for the two flags when the flag is not given: a
+        // run config's env turns the tier on, and an engine without the tier ignores them (no flag it would refuse)
+        if (o.conversation_disk_dir.empty())
+            if (const char* d = std::getenv("STRATA_CONV_DISK_DIR"); d != nullptr && *d != '\0') {
+                o.conversation_disk_dir = d;
+                if (const char* m = std::getenv("STRATA_CONV_DISK_MIB"); m != nullptr && *m != '\0') {
+                    char* end = nullptr;
+                    const long long v = std::strtoll(m, &end, 10);
+                    if (end != m && *end == '\0' && v > 0) o.conversation_disk_mib = (int64_t) v;
+                }
+            }
         strata::core::ConversationDiskOptions disk_opts;
         disk_opts.dir = conversations.enabled() ? o.conversation_disk_dir : std::string();
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
