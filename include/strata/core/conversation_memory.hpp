@@ -64,6 +64,14 @@ std::optional<HostMemoryReading> sample_host_memory();
 
 std::optional<uint64_t> available_host_bytes();
 
+/// Linux, cgroup v2 (5.19+): asks the kernel to reclaim `bytes` from this process's own group through its
+/// memory.reclaim, clean file cache first.  A group held at memory.high by the model file's page cache samples as
+/// nearly full (its active file cache is not credited above), yet the kernel can still give that cache back.  True
+/// when the whole request was reclaimed; false when there is no v2 group or no such file, when the write is refused,
+/// or when less was reclaimed (EAGAIN).  The caller samples again either way.  Other systems: false.
+bool reclaim_own_cgroup(uint64_t bytes, const MemoryProbePaths& paths);
+bool reclaim_own_cgroup(uint64_t bytes);
+
 /// #3493: the conversation cache budget (MiB) --serve uses when --conversation-cache-mib was not given, from the RAM that is available
 /// once the model is loaded: 40% of what is left above the parking floor, at most 8192 (four 100K-token agent conversations were
 /// parked in 8 GiB in the report), in steps of 256, and 0 (off) when less than 1024 would be left to give.  Unknown telemetry: 0.

@@ -12243,15 +12243,55 @@ int main(int argc, char** argv) {
             malloc_trim(0);
 #endif
         };
+        // A cgroup held at memory.high by the model file's page cache samples as nearly full (only its inactive file
+        // cache is credited): before refusing, ask the kernel to reclaim the shortfall from this engine's own group
+        // (STRATA_CGROUP_RECLAIM=0: never)
+        const bool cgroup_reclaim = [] {
+            const char* e = std::getenv("STRATA_CGROUP_RECLAIM");
+            return e == nullptr || std::strcmp(e, "0") != 0;
+        }();
         auto make_ram = [&](uint64_t need, uint64_t floor, size_t& evicted,
                             std::optional<strata::core::HostMemoryReading>& mem, int64_t wait_ms) -> bool {
-            bool trimmed = false;
+            bool trimmed = false, reclaimed = !cgroup_reclaim;
             for (;;) {
                 mem = strata::core::sample_host_memory();
                 if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
                                                             need, floor))
                     return true;
                 if (!trimmed) { return_freed_heap(); trimmed = true; continue; }
+                if (!reclaimed && mem && mem->source == strata::core::MemorySource::cgroup) {
+                    reclaimed = true;
+                    const uint64_t want = need > UINT64_MAX - floor ? UINT64_MAX : need + floor;
+                    const uint64_t gap0 = want > mem->available ? want - mem->available : 0;
+                    if (gap0 > 0 && gap0 <= (4ull << 30)) {   // more than that is not page cache worth dropping
+                        // The kernel takes the inactive file cache first, and the sample already credits that cache:
+                        // the room grows only once reclaim reaches past it.  Ask for the shortfall on top of the
+                        // credited cache, again while the room has not come: at most 4 rounds and 6 GiB in all.
+                        const uint64_t before = mem->available, cap = 6ull << 30;
+                        uint64_t asked = 0, gap = gap0;
+                        int rounds = 0;
+                        bool partial = false;
+                        const auto r0 = Clock::now();
+                        while (gap > 0 && rounds < 4 && asked < cap) {
+                            const uint64_t ask = std::min<uint64_t>(gap + mem->credit + (256ull << 20), cap - asked);
+                            ++rounds;
+                            asked += ask;
+                            partial = !strata::core::reclaim_own_cgroup(ask);
+                            mem = strata::core::sample_host_memory();
+                            if (!mem || mem->source != strata::core::MemorySource::cgroup) break;
+                            gap = want > mem->available ? want - mem->available : 0;
+                            if (partial) break;   // no file, or EAGAIN: the kernel had less to give than asked
+                        }
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+                        std::fprintf(stderr, "strata serve: conversation memory: %llu MiB short of the room asked; asked "
+                                     "the kernel to reclaim %llu MiB of this engine's cgroup in %d round%s, %.0f ms%s: "
+                                     "%llu -> %lld MiB available\n", (unsigned long long) (gap0 >> 20),
+                                     (unsigned long long) (asked >> 20), rounds, rounds == 1 ? "" : "s", ms,
+                                     partial ? " (the last one in part)" : "", (unsigned long long) (before >> 20),
+                                     mem ? (long long) (mem->available >> 20) : -1LL);
+                        continue;
+                    }
+                }
                 if (conv_disk.pending()) {
                     // beating and bounded: a slow disk held the request here as long as its queued writes took
                     if (!conv_disk.wait_idle_for(wait_ms, [] { strata::core::progress_beat(); })) return false;
