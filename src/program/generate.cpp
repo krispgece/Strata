@@ -12219,6 +12219,16 @@ int main(int argc, char** argv) {
         if (std::string disk_err; !conv_disk.open(disk_err))
             std::fprintf(stderr, "strata serve: conversation disk tier off: %s\n", disk_err.c_str());
         bool disk_writes = conv_disk.enabled() && o.conversation_disk_persist != "exit-only";   // none until QUIT
+        // (local build) STRATA_CONV_DISK_STREAM=1: every park the disk tier takes and every read back of a file goes straight
+        // between the GPUs and the files (the streamed paths below), never staged whole in RAM; with a 1 MiB RAM cache
+        // (--conversation-cache-mib 1) no conversation is held in RAM at all
+        const bool disk_stream_only = conv_disk.enabled() && [] {
+            const char* v = std::getenv("STRATA_CONV_DISK_STREAM");
+            return v != nullptr && std::string(v) == "1";
+        }();
+        if (disk_stream_only)
+            std::fprintf(stderr, "strata serve: conversation disk: streamed only (STRATA_CONV_DISK_STREAM=1): parks and read "
+                                 "backs go between the GPUs and the files, not through RAM\n");
         if (conv_disk.enabled())
             conversations.set_on_evict([&conv_disk, &disk_writes](strata::core::SavedConversation&& image) {
                 if (!disk_writes) return;
@@ -12443,6 +12453,13 @@ int main(int argc, char** argv) {
                                  conversations.size(), conversations.bytes(), conversations.evictions());
                 return ok;
             };
+            if (to_disk && disk_writes && disk_stream_only) {   // STRATA_CONV_DISK_STREAM=1: never staged in RAM
+                if (!park_streamed())
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens%s: the streamed write "
+                                         "failed, and STRATA_CONV_DISK_STREAM keeps it out of RAM)\n",
+                                 src.ids.size(), src.what.c_str());
+                return true;
+            }
             const auto t0 = Clock::now();
             try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
@@ -16484,8 +16501,9 @@ int main(int argc, char** argv) {
                     size_t evicted = 0;   // (one count for both admissions: the RAM cache's indices move with each)
                     std::optional<strata::core::HostMemoryReading> room;
                     // no room for the whole image: its K/V is streamed into the GPUs after the outgoing one is parked
-                    if (!on_disk.queued && !make_ram(on_disk.bytes, floor, evicted, room, disk_restore_wait_ms))
-                        stream = on_disk;
+                    if (!on_disk.queued &&
+                        (disk_stream_only || !make_ram(on_disk.bytes, floor, evicted, room, disk_restore_wait_ms)))
+                        stream = on_disk;   // (STRATA_CONV_DISK_STREAM=1: always)
                     if (stream.id == 0) {
                         auto admit = [&](uint64_t need, std::string& why) -> bool {
                             std::optional<strata::core::HostMemoryReading> mem;
