@@ -1127,7 +1127,9 @@ class Host:
         else:
             child.send_signal(signal.SIGTERM)
         try:
-            code = child.wait(timeout=self.shutdown_timeout + 8)
+            # at least 85 s: the server's close() gives the engine 75 s after QUIT, where --conversation-disk-persist
+            # saves the live conversation (~23 s at 204K tokens)
+            code = child.wait(timeout=max(self.shutdown_timeout + 8, 85))
         except subprocess.TimeoutExpired:
             self._kill_child_tree()
             child.wait(timeout=10)

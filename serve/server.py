@@ -107,7 +107,8 @@ def popen(what: str, args: list, role: str = "engine", **kw):
 
 
 # How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
-ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
+# QUIT gets 75 s: with --conversation-disk-persist the engine saves the live conversation first (~23 s at 204K tokens).
+ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 75, 5, 20
 
 
 def rttime_limit_note() -> str:
@@ -9951,9 +9952,16 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     # loads is not the default "die at once". SIGINT keeps Python's own handler (a second Ctrl+C stops waiting).
     termination = "sigint"
     finished = threading.Event()                        # set when the clean stop is over (a Windows console handler waits for it)
+    stop_asked = threading.Event()                      # the first stop request has been taken
 
     def request_stop(reason: str):
         nonlocal termination
+        # Only the first one counts. At logout systemd sends SIGTERM to every process of the app at once, and the runtime
+        # host and the owner guard then send their own: taken for "Ctrl+C again", the second one killed the engine in
+        # the middle of a --conversation-disk-persist save. A second Ctrl+C (SIGINT) still ends the engine at once.
+        if stop_asked.is_set():
+            return
+        stop_asked.set()
         termination = reason
         if threading.current_thread() is threading.main_thread():
             raise KeyboardInterrupt
