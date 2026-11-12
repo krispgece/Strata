@@ -108,6 +108,30 @@ bool same(const SavedConversation& a, const SavedConversation& b) {
     return true;
 }
 
+// put_streamed's K/V sources over an image's own buffers (the engine's read from the GPU); `img` outlives them
+std::vector<SessionKvSource> sources_of(const SavedConversation& img) {
+    std::vector<SessionKvSource> out;
+    for (const auto& kv : img.kv) {
+        SessionKvSource s;
+        s.format = kv.format; s.cells = kv.cells; s.heads = kv.heads; s.head_dim = kv.head_dim;
+        s.page_size = kv.page_size; s.pooled_rows = kv.pooled_rows; s.idx_dim = kv.idx_dim;
+        const ConversationBuffer* parts[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+        for (size_t p = 0; p < 5; ++p) s.sizes[p] = parts[p]->size();
+        s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+            return parts[part]->read(dst, offset, n);
+        };
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+// what a streamed park hands the tier: the image without its K/V, which the sources give
+SavedConversation without_kv(SavedConversation s) {
+    s.kv.clear();
+    for (auto& stage : s.stage_images) stage.kv.clear();
+    return s;
+}
+
 std::vector<int32_t> prompt_of(size_t tokens, int32_t first = 1000) {
     std::vector<int32_t> p;
     for (size_t i = 0; i < tokens; ++i) p.push_back(first + int32_t(i));
@@ -252,21 +276,6 @@ int main() {
     }
 
     {   // put_streamed: the K/V read from where it lives (here: the image's own buffers) gives the same files
-        auto sources_of = [](const SavedConversation& img) {
-            std::vector<SessionKvSource> out;
-            for (const auto& kv : img.kv) {
-                SessionKvSource s;
-                s.format = kv.format; s.cells = kv.cells; s.heads = kv.heads; s.head_dim = kv.head_dim;
-                s.page_size = kv.page_size; s.pooled_rows = kv.pooled_rows; s.idx_dim = kv.idx_dim;
-                const ConversationBuffer* parts[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
-                for (size_t p = 0; p < 5; ++p) s.sizes[p] = parts[p]->size();
-                s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
-                    return parts[part]->read(dst, offset, n);
-                };
-                out.push_back(std::move(s));
-            }
-            return out;
-        };
         const SavedConversation expect = split_image(500, 30, 9000);
         std::vector<std::vector<SessionKvSource>> sources = {sources_of(expect), sources_of(expect.stage_images[0])};
         SavedConversation meta = split_image(500, 30, 9000);
@@ -280,6 +289,35 @@ int main() {
         SavedConversation back;
         check(m.tokens == 500 && tier.take(m.id, m.tokens, back, e) && same(back, expect),
               "put_streamed: read back exactly the image the sources came from");
+    }
+
+    {   // put_streamed and the budget: the size counts the K/V in the sources, so the oldest goes for a new one with
+        // its files; an image above the budget is refused before a write and given back to the caller
+        { std::lock_guard<std::mutex> g(lines_m); lines.clear(); }
+        const SavedConversation first = split_image(400, 40, 20000), second = split_image(500, 41, 30000);
+        SavedConversation meta1 = without_kv(first), meta2 = without_kv(second);
+        ConversationDiskTier tier(opts(dir, 50ull << 20));   // one ~34 MiB split image, not two
+        check(tier.open(e) && tier.put_streamed(meta1, {sources_of(first), sources_of(first.stage_images[0])}),
+              "streamed budget: first written");
+        check(tier.size() == 1 && tier_files(dir) == 2 && tier.stats().evicted == 0, "streamed budget: first fits");
+        check(tier.put_streamed(meta2, {sources_of(second), sources_of(second.stage_images[0])}),
+              "streamed budget: second written");
+        check(tier.size() == 1 && tier.stats().evicted == 1 && tier_files(dir) == 2 && logged("1 removed for the budget"),
+              "streamed budget: the second evicts the first, its files too");
+        check(tier.best(prompt_of(450, 20000), {}, false).tokens == 0, "streamed budget: the evicted one no longer matches");
+        const auto m = tier.best(prompt_of(600, 30000), {}, false);
+        SavedConversation back;
+        check(m.tokens == 500 && tier.take(m.id, m.tokens, back, e) && same(back, second),
+              "streamed budget: the newer one reads back exactly");
+
+        ConversationDiskTier small(opts(dir, 20ull << 20));
+        SavedConversation meta3 = without_kv(first);
+        check(small.open(e) && !small.put_streamed(meta3, {sources_of(first), sources_of(first.stage_images[0])}) &&
+              small.size() == 0 && tier_files(dir) == 0, "streamed above the budget: refused, nothing written");
+        check(small.stats().write_failed == 1 && logged("is over the disk budget"),
+              "streamed above the budget: counted and logged");
+        check(meta3.stage_images.size() == 1 && meta3.checkpoints.size() == 2 && same_checkpoint(meta3.live, first.live),
+              "streamed above the budget: the caller's image given back");
     }
 
     {   // take with K/V targets: the files' K/V streamed into them (here: CPU buffers), the rest in `out`
