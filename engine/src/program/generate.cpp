@@ -1745,6 +1745,51 @@ static std::string ram_note(const std::optional<strata::core::HostMemoryReading>
     return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
 }
 
+// The RAM guard for a read from the SSD tier, with one more try before a refusal: a cgroup held at memory.high samples as
+// nearly full while the kernel could still give pages back (file cache the sample does not credit, cold anonymous
+// pages to swap).  When the binding term is a cgroup and the shortfall is at most 4 GiB, the shortfall plus the
+// credited cache plus 256 MiB is asked from this engine's own group's memory.reclaim (the kernel takes the credited
+// cache first, so the room grows only past it), again while the room has not come: at most 4 rounds and 6 GiB in all.
+// One log line says what was asked and the room before and after.  STRATA_CGROUP_RECLAIM=0: never.  `mem` is the last
+// sample.
+static bool ram_admit_reclaim(uint64_t need, uint64_t floor, std::optional<strata::core::HostMemoryReading>& mem) {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_CGROUP_RECLAIM");
+        return e == nullptr || std::strcmp(e, "0") != 0;
+    }();
+    auto admits = [&] {
+        return strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor);
+    };
+    mem = strata::core::sample_host_memory();
+    if (admits()) return true;
+    if (!on || !mem || mem->source != strata::core::MemorySource::cgroup) return false;
+    const uint64_t want = need > UINT64_MAX - floor ? UINT64_MAX : need + floor;
+    const uint64_t gap0 = want > mem->available ? want - mem->available : 0;
+    if (gap0 == 0 || gap0 > (4ull << 30)) return false;   // more than that is not worth taking from the engine's pages
+    const uint64_t before = mem->available, cap = 6ull << 30;
+    uint64_t asked = 0, gap = gap0;
+    int rounds = 0;
+    bool partial = false;
+    const auto r0 = Clock::now();
+    while (gap > 0 && rounds < 4 && asked < cap) {
+        const uint64_t ask = std::min<uint64_t>(gap + mem->credit + (256ull << 20), cap - asked);
+        ++rounds;
+        asked += ask;
+        partial = !strata::core::reclaim_own_cgroup(ask);
+        mem = strata::core::sample_host_memory();
+        if (!mem || mem->source != strata::core::MemorySource::cgroup) break;
+        gap = want > mem->available ? want - mem->available : 0;
+        if (partial) break;   // no file, or EAGAIN: the kernel had less to give than asked
+    }
+    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+    std::fprintf(stderr, "strata serve: conversation memory: %llu MiB short of the room asked; asked the kernel to reclaim %llu "
+                 "MiB of this engine's cgroup in %d round%s, %.0f ms%s: %llu -> %lld MiB available\n",
+                 (unsigned long long) (gap0 >> 20), (unsigned long long) (asked >> 20), rounds, rounds == 1 ? "" : "s", ms,
+                 partial ? " (the last one in part)" : "", (unsigned long long) (before >> 20),
+                 mem ? (long long) (mem->available >> 20) : -1LL);
+    return admits();
+}
+
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
 struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard (Linux) / all (Windows)
@@ -19651,9 +19696,8 @@ int main(int argc, char** argv) {
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         pools_budget.shrink((size_t) -1);
                         limits.admit = [floor, &o](uint64_t need, std::string& w) {
-                            const auto mem = strata::core::sample_host_memory();
-                            if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
-                                                                        need, floor)) return true;
+                            std::optional<strata::core::HostMemoryReading> mem;
+                            if (ram_admit_reclaim(need, floor, mem)) return true;
                             w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                 std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " + ram_note(mem) + ")";
                             return false;
@@ -20074,9 +20118,8 @@ int main(int argc, char** argv) {
                     strata::core::SessionReadLimits limits;
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                     limits.admit = [floor, &o](uint64_t need, std::string& w) {
-                        const auto mem = strata::core::sample_host_memory();
-                        if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
-                                                                    need, floor)) return true;
+                        std::optional<strata::core::HostMemoryReading> mem;
+                        if (ram_admit_reclaim(need, floor, mem)) return true;
                         w = "not enough RAM even for the running state (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                             std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " + ram_note(mem) + ")";
                         return false;
